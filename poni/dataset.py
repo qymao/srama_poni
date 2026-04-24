@@ -877,7 +877,16 @@ class SemanticMapPrecomputedDataset(SemanticMapDataset):
             dilated_frontier = torch.nn.functional.max_pool2d(
                 frontiers.float(), k, stride=1, padding=k // 2
             )  # (1, 1, H, W), values in {0, 1}
-            frontier_weight = 1.0 + beta * dilated_frontier[0, 0]  # (H, W)
+            if getattr(self.cfg, 'nav_loss_explored_only', False):
+                # Supervise only observed + frontier regions; zero-weight on
+                # unexplored non-frontier pixels to align with inference, where
+                # waypoints are placed near frontiers rather than in the interior
+                # of unseen space.
+                # in_semmap is (N, H, W) at this point (batch dim already removed).
+                frontier_mask = dilated_frontier[0, 0] > 0.5
+                frontier_weight = (exp_map | frontier_mask).float() + beta * dilated_frontier[0, 0]
+            else:
+                frontier_weight = 1.0 + beta * dilated_frontier[0, 0]  # (H, W)
 
         # Remove batch dim
         out_base_masks = out_base_masks.squeeze(0)

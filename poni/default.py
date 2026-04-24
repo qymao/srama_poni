@@ -97,6 +97,8 @@ _C.DATASET.nav_frontier_weight_beta = 2.0
 # frontier edge rather than just the single-pixel boundary.
 _C.DATASET.nav_frontier_dilate_k = 15  # must be odd
 
+_C.DATASET.nav_loss_explored_only = False
+
 # Model side: controls whether nav_decoder is instantiated and nav_loss used.
 _C.MODEL.enable_nav_head = False
 
