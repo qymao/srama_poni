@@ -28,6 +28,7 @@ from poni.constants import (
     # General constants
     CAT_OFFSET,
     FLOOR_ID,
+    WALL_ID,
     # Coloring
     d3_40_colors_rgb,
     gibson_palette,
@@ -582,9 +583,10 @@ class SemanticMapPrecomputedDataset(SemanticMapDataset):
         fmm_dists = torch.from_numpy(data['fmm_dists'])
         # Compute object_pfs
         object_pfs = self.compute_object_pfs(fmm_dists)
-        loss_masks, masks, dirs, locs, area_pfs, acts, frontiers = self.get_masks_and_labels(
-            in_semmap, semmap, fmm_dists
-        )
+        (
+            loss_masks, masks, dirs, locs, area_pfs, acts, frontiers,
+            in_floor_label, frontier_weight,
+        ) = self.get_masks_and_labels(in_semmap, semmap, fmm_dists)
         if self.cfg.potential_function_masking:
             object_pfs = torch.clamp(object_pfs * masks, 0.0, 1.0)
 
@@ -614,6 +616,11 @@ class SemanticMapPrecomputedDataset(SemanticMapDataset):
             label['acts'] = acts
         if frontiers is not None:
             label['frontiers'] = frontiers
+        # NCM labels (only present when DATASET.enable_nav_label=True)
+        if in_floor_label is not None:
+            label['in_floor_label'] = in_floor_label      # (H, W), float {0,1}
+        if frontier_weight is not None:
+            label['frontier_weight'] = frontier_weight    # (H, W), float ≥ 1
         # Free memory
         del data
         gc.collect()
@@ -844,7 +851,39 @@ class SemanticMapPrecomputedDataset(SemanticMapDataset):
             )
             out_area_pfs = out_area_pfs.squeeze(1) # (1, H, W)
 
+        # ── Navigability Completion Module (NCM) labels ─────────────────────────
+        # These are only computed when DATASET.enable_nav_label is True to avoid
+        # overhead in runs that don't use the NCM head.
+        in_floor_label = None
+        frontier_weight = None
+        if getattr(self.cfg, 'enable_nav_label', False):
+            # --- in_floor_label ---
+            # out_semmap underwent the SAME crop+rotate as in_semmap, so
+            # out_semmap[0, FLOOR_ID] is the global floor projected into the exact
+            # same local frame.  This serves as the per-pixel binary GT for the
+            # navigability decoder: 1 = navigable floor, 0 = everything else.
+            # Crucially, this label is non-zero even in UNOBSERVED regions of
+            # in_semmap — that is precisely what the decoder must learn to predict.
+            in_floor_label = (out_semmap[0, FLOOR_ID] >= 0.5).float()  # (H, W)
+
+            # --- frontier_weight ---
+            # Waypoint selection happens near frontiers, yet that is where the
+            # navigability prediction is most uncertain.  Upweighting the BCE
+            # loss at frontiers steers the decoder toward correctness exactly
+            # where it matters most, without hurting accuracy in observed regions.
+            beta = getattr(self.cfg, 'nav_frontier_weight_beta', 2.0)
+            k = getattr(self.cfg, 'nav_frontier_dilate_k', 15)
+            # Dilate the binary frontier mask to cover a meaningful neighbourhood.
+            dilated_frontier = torch.nn.functional.max_pool2d(
+                frontiers.float(), k, stride=1, padding=k // 2
+            )  # (1, 1, H, W), values in {0, 1}
+            frontier_weight = 1.0 + beta * dilated_frontier[0, 0]  # (H, W)
+
         # Remove batch dim
         out_base_masks = out_base_masks.squeeze(0)
         out_masks = out_masks.squeeze(0)
-        return out_base_masks, out_masks, out_dirs, out_locs, out_area_pfs, out_acts, contours
+        return (
+            out_base_masks, out_masks, out_dirs, out_locs,
+            out_area_pfs, out_acts, contours,
+            in_floor_label, frontier_weight,
+        )

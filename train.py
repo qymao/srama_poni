@@ -70,11 +70,31 @@ class SemanticMapperModule(nn.Module):
             self.cfg.defrost()
             self.cfg.MODEL.enable_area_head = enable_area_head
             self.cfg.freeze()
+        # Propagate MODEL.enable_nav_head → DATASET.enable_nav_label so the
+        # user only needs to set one flag. Mirrors the enable_area_head pattern.
+        if self.cfg.MODEL.get("enable_nav_head", False):
+            self.cfg.defrost()
+            self.cfg.DATASET.enable_nav_label = True
+            self.cfg.freeze()
         (
             self.encoder,
             self.object_decoder,
             self.area_decoder,
         ) = get_semantic_encoder_decoder(self.cfg)
+
+        # ── Navigability Completion Module (NCM) ─────────────────────────────
+        # Shares the frozen UNet encoder → only the lightweight decoder adds
+        # parameters. Predicts binary floor navigability for BOTH observed AND
+        # unobserved regions, supervised by the global floor GT (in_floor_label).
+        self.nav_decoder = None
+        if self.cfg.MODEL.get("enable_nav_head", False):
+            from poni.model import UNetDecoder
+            self.nav_decoder = UNetDecoder(
+                1,                                   # single navigability channel
+                self.cfg.MODEL.nsf,
+                bilinear=self.cfg.MODEL.unet_bilinear_interp,
+            )
+
         # Define optimizer
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.cfg.OPTIM.lr)
         # Define scheduler
@@ -93,7 +113,16 @@ class SemanticMapperModule(nn.Module):
         area_preds = None
         if self.area_decoder is not None:
             area_preds = self.area_activation(self.area_decoder(embedding))
-        return object_preds, area_preds
+
+        # nav_logits: raw (pre-sigmoid) navigability map (B, 1, H, W).
+        # Keeping logits here lets batch_step apply BCEWithLogitsLoss directly
+        # (numerically more stable than BCE on sigmoid outputs).
+        # At inference time, sigmoid is applied in infer() before gating.
+        nav_logits = None
+        if self.nav_decoder is not None:
+            nav_logits = self.nav_decoder(embedding)  # (B, 1, H, W)
+
+        return object_preds, area_preds, nav_logits
 
     def get_inv_dists_map(self, x):
         # x - (bs, N, M, M)
@@ -115,11 +144,15 @@ class SemanticMapperModule(nn.Module):
 
     def infer(self, x, do_forward_pass=True, input_maps=None, avg_preds=True):
         if do_forward_pass:
-            object_preds, area_preds = self(x)
+            object_preds, area_preds, nav_logits = self(x)
         else:
+            # Legacy callers may pass a 2-tuple; handle gracefully.
             assert input_maps is not None
-            object_preds, area_preds = x
+            nav_logits = x[2] if (isinstance(x, (list, tuple)) and len(x) > 2) else None
+            object_preds, area_preds = x[0], x[1]
             x = input_maps
+        # Convert logits → probability once, reused for gating.
+        nav_pred = torch.sigmoid(nav_logits) if nav_logits is not None else None
 
         if self.cfg.MODEL.output_type == "dirs":
             ####################################################################
@@ -193,9 +226,9 @@ class SemanticMapperModule(nn.Module):
             outputs = object_preds
             if area_preds is not None:
                 outputs = (object_preds + area_preds) / 2.0
-            return outputs
+            return outputs, nav_pred
         else:
-            return object_preds, area_preds
+            return object_preds, area_preds, nav_pred
 
     def calculate_frontiers(self, x):
         # x - semantic map of shape (B, N, H, W)
@@ -233,7 +266,7 @@ class SemanticMapperModule(nn.Module):
     def batch_step(self, batch):
         inputs, labels = batch
         input_maps = inputs["semmap"]
-        object_preds, area_preds = self(input_maps)
+        object_preds, area_preds, nav_logits = self(input_maps)
         losses = {}
         if self.cfg.MODEL.output_type == "map":
             # object_preds - (B, N + 2, H, W)
@@ -299,6 +332,37 @@ class SemanticMapperModule(nn.Module):
             area_pf_loss = self.area_loss_fn(area_preds, area_gts).mean()
             loss = loss + area_pf_loss
             losses["area_pf_loss"] = area_pf_loss.item()
+
+        # ── NCM loss ─────────────────────────────────────────────────────────
+        # Only computed when both the nav head is enabled AND the dataset was
+        # configured to produce in_floor_label (enable_nav_label=True).
+        if nav_logits is not None and "in_floor_label" in labels:
+            nav_label = labels["in_floor_label"]          # (B, H, W), float {0,1}
+            nav_logits_2d = nav_logits.squeeze(1)         # (B, H, W)
+
+            # pos_weight compensates the floor/non-floor class imbalance:
+            # moving it to the correct device here avoids storing it as a
+            # module buffer (which would complicate DDP sync).
+            pos_w = torch.tensor(
+                self.cfg.MODEL.get("nav_pos_weight", 3.0),
+                device=nav_logits_2d.device,
+            )
+            nav_loss_map = F.binary_cross_entropy_with_logits(
+                nav_logits_2d, nav_label,
+                pos_weight=pos_w,
+                reduction="none",
+            )  # (B, H, W)
+
+            # Frontier-weighted upsampling: cells near frontiers contribute
+            # more to the loss, steering the decoder to be accurate exactly
+            # where waypoint choices are made.
+            if "frontier_weight" in labels:
+                nav_loss_map = nav_loss_map * labels["frontier_weight"]
+
+            nav_loss = nav_loss_map.mean()
+            lam_nav = self.cfg.MODEL.get("nav_loss_weight", 0.5)
+            loss = loss + lam_nav * nav_loss
+            losses["nav_loss"] = nav_loss.item()
 
         return {"loss": loss, "losses": losses}
 
@@ -565,6 +629,9 @@ class Trainer:
                     "locs",
                     "area_pfs",
                     "acts",
+                    # NCM labels
+                    "in_floor_label",
+                    "frontier_weight",
                 ]:
                     if key in labels and labels[key] is not None:
                         labels[key] = labels[key].to(self.device)
@@ -647,6 +714,9 @@ class Trainer:
                             "locs",
                             "area_pfs",
                             "acts",
+                            # NCM labels
+                            "in_floor_label",
+                            "frontier_weight",
                         ]:
                             if key in labels and labels[key] is not None:
                                 labels[key] = labels[key].to(self.device)

@@ -28,9 +28,11 @@ class Potential_Function_Semantic_Policy(nn.Module):
 
     def forward(self, inputs, rnn_hxs, masks, extras):
         # inputs - (bs, N, H, W)
-        # x_pf - (bs, N, H, W), x_a - (bs, 1, H, W)
-        x_pf, x_a = self.pf_model.infer(inputs, avg_preds=False)
-        return x_pf, x_a
+        # x_pf  - (bs, N, H, W)  potential fields
+        # x_a   - (bs, 1, H, W)  area potential field (or None)
+        # x_nav - (bs, 1, H, W)  navigability probability ∈ [0,1] (or None)
+        x_pf, x_a, x_nav = self.pf_model.infer(inputs, avg_preds=False)
+        return x_pf, x_a, x_nav
 
     def add_agent_dists_to_object_dists(self, pfs, agent_dists):
         # pfs - (B, N, H, W)
@@ -92,7 +94,7 @@ class RL_Policy(nn.Module):
         raise NotImplementedError
 
     def act(
-        self, inputs, rnn_hxs, masks, extras=None, extra_maps=None, deterministic=False
+        self, inputs, rnn_hxs, masks, steps=[], extras=None, extra_maps=None, deterministic=False
     ):
 
         assert extra_maps is not None
@@ -125,10 +127,12 @@ class RL_Policy(nn.Module):
             t_proc_inputs = pgeo.spatial_transform_map(t_proc_inputs, t_ego_agent_poses)
 
         with torch.no_grad():
-            t_pfs, t_area_pfs = self.network(t_proc_inputs, rnn_hxs, masks, extras)
+            t_pfs, t_area_pfs, t_nav_pred = self.network(t_proc_inputs, rnn_hxs, masks, extras)
 
-        if self.has_action_output:
+        if self.has_action_output:  # False, only when (cfg.MODEL.output_type == "acts"), == 'map' here.
             goal_cat_id = extras[:, 1].long()  # (bs, )
+            # object_pfs - (B, N + 2, H, W) is about all categories.
+            # In inference, we only need one channel.
             out_actions = [
                 t_pfs[e, gcat.item() + 2].argmax().item()
                 for e, gcat in enumerate(goal_cat_id)
@@ -138,6 +142,7 @@ class RL_Policy(nn.Module):
         # Transform back the prediction if needed
         pfs = t_pfs
         area_pfs = t_area_pfs
+        nav_pred = t_nav_pred
         if self.needs_egocentric_transform:
             # Compute transform from t_ego_agent_poses -> origin
             origin_pose = torch.Tensor([[0.0, 0.0, 0.0]]).to(inputs.device)
@@ -146,6 +151,11 @@ class RL_Policy(nn.Module):
             if area_pfs is not None:
                 area_pfs = pgeo.spatial_transform_map(
                     area_pfs, rev_ego_agent_poses
+                )  # (B, 1, H, W)
+            # Transform navigability map back to world frame alongside pfs.
+            if nav_pred is not None:
+                nav_pred = pgeo.spatial_transform_map(
+                    nav_pred, rev_ego_agent_poses
                 )  # (B, 1, H, W)
 
         # Add agent to location distance if needed
@@ -157,12 +167,16 @@ class RL_Policy(nn.Module):
             pfs = self.network.convert_distance_to_pf(pfs_dists)
 
         dist_pfs = None
-        if self.args.add_agent2loc_distance_v2:
+        if self.args.add_agent2loc_distance_v2:  # author setting: False
             agent_dists = extra_maps["dmap"].unsqueeze(1)  # (B, 1, H, W)
             dist_pfs = self.network.convert_distance_to_pf(agent_dists)
 
         # Take the mean with area_pfs
         init_pfs = pfs
+        # (Pdb) type(pfs)
+        # <class 'torch.Tensor'>
+        # (Pdb) pfs.shape
+        # torch.Size([5, 17, 480, 480])
         if area_pfs is not None:
             if dist_pfs is None:
                 awc = self.args.area_weight_coef
@@ -175,17 +189,26 @@ class RL_Policy(nn.Module):
 
         # Get action
         goal_cat_id = extras[:, 1].long()
-        action = self.get_action(
+        # action: an xy position
+        action, valid_mask = self.get_action(
             pfs,
             goal_cat_id,
             extra_maps["umap"],
             extra_maps["dmap"],
             extra_maps["agent_locations"],
+            nav_pred=nav_pred,
+            proc_inputs=t_proc_inputs,   # needed to derive known-floor hard mask
         )
         pred_maps = {
             "pfs": pfs,
             "raw_pfs": init_pfs,
             "area_pfs": area_pfs,
+            # nav_pred   (B, 1, H, W): raw model sigmoid output, world frame.
+            # valid_mask (B, 1, H, W): nav_pred with hard overrides applied —
+            #   known_free→1, known_obstacle→0. This is the exact mask used to
+            #   gate goal_pfs before argmax. None when nav_gate_waypoint=False.
+            "nav_pred":   nav_pred,
+            "valid_mask": valid_mask,
         }
         pred_maps = {
             k: asnumpy(v) if v is not None else v for k, v in pred_maps.items()
@@ -228,35 +251,74 @@ class RL_Policy(nn.Module):
         outputs = torch.cat([free_map, obstacle_map, semantic_map], dim=1)
         return outputs
 
-    def get_action(self, pfs, goal_cat_id, umap, dmap, agent_locs):
+    def get_action(
+        self, pfs, goal_cat_id, umap, dmap, agent_locs,
+        nav_pred=None, proc_inputs=None,
+    ):
         """
-        Computes distance from (agent -> location) + (location -> goal)
-        based on PF predictions. It then selects goal as location with
-        least distance.
+        Select a waypoint from the goal potential field.
+
+        Validity-gated selection (NCM):
+            valid_mask = known_floor (hard, from observed in_semmap)
+                       + predicted_floor (soft, from nav_pred) in unobserved regions.
+            goal_pf is multiplied by valid_mask before argmax, so the waypoint
+            cannot land on walls or out-of-bounds even in unobserved areas.
 
         Args:
-            pfs = (B, N + 2, H, W) potential fields
-            goal_cat_id = (B, ) goal category
-            umap = (B, H, W) unexplored map
-            dmap = (B, H, W) geodesic distance from agent map
-            agent_locs = B x 2 list of agent positions
+            pfs          (B, N+2, H, W) – potential fields for all categories
+            goal_cat_id  (B,)           – target category index (0-based object id)
+            umap         (B, H, W)      – unexplored map (1=unknown, 0=explored)
+            dmap         (B, H, W)      – geodesic distance from agent
+            agent_locs   list[B x 2]    – agent (row, col) positions
+            nav_pred     (B, 1, H, W)   – navigability probability from NCM, or None
+            proc_inputs  (B, C, H, W)   – processed semantic map (ch0=free), or None
         """
-        B, N, H, W = pfs.shape[0], pfs.shape[1] - 2, pfs.shape[2], pfs.shape[3]
-        goal_pfs = []
-        for b in range(B):
-            goal_pf = pfs[b, goal_cat_id[b].item() + 2, :]
-            goal_pfs.append(goal_pf)
-        goal_pfs = torch.stack(goal_pfs, dim=0)
-        agt2loc_dist = dmap
+        B, _, H, W = pfs.shape
+        goal_pfs = torch.stack(
+            [pfs[b, goal_cat_id[b].item() + 2] for b in range(B)], dim=0
+        )  # (B, H, W)
+
         if self.args.pf_masking_opt == "unexplored":
-            # Filter out explored locations
             goal_pfs = goal_pfs * umap
-        # Filter out locations very close to the agent
+
+        # Filter locations very close to the agent.
         if self.args.mask_nearest_locations:
             for i in range(B):
                 ri, ci = agent_locs[i]
                 size = int(self.args.mask_size * 100.0 / self.args.map_resolution)
                 goal_pfs[i, ri - size : ri + size + 1, ci - size : ci + size + 1] = 0
+
+        # ── NCM: Validity-Gated Waypoint Selection ────────────────────────────
+        # Design: combine a HARD mask for observed free-space (100% reliable)
+        # with a SOFT mask (nav_pred) for unobserved regions.  This way the
+        # model never places a waypoint on a known wall, and it also avoids
+        # predicted walls in areas it has not yet seen — without any threshold
+        # hyper-parameter.
+        valid_mask_out = None   # exposed to act() for visualization
+        cfg_model = self.network.cfg.MODEL
+        if nav_pred is not None and cfg_model.get("nav_gate_waypoint", True):
+            nav_prob = nav_pred.squeeze(1)   # (B, H, W), ∈ [0, 1]
+
+            if proc_inputs is not None:
+                # ch0 of proc_inputs = known free (observed floor).
+                # For those cells, override nav_pred with 1 (certainty).
+                known_free = (proc_inputs[:, 0] >= 0.5)            # (B, H, W)
+                # Cells with any observed semantic content but NOT free are walls
+                # or objects → hard-zero them (nav_prob already tends to 0 there,
+                # but this makes it exact for observed regions).
+                observed = (proc_inputs.max(dim=1).values >= 0.5)  # (B, H, W)
+                known_obstacle = observed & ~known_free             # (B, H, W)
+
+                valid_mask = nav_prob.clone()
+                valid_mask[known_free] = 1.0
+                valid_mask[known_obstacle] = 0.0
+            else:
+                assert False
+                valid_mask = nav_prob
+
+            goal_pfs = goal_pfs * valid_mask
+            valid_mask_out = valid_mask.unsqueeze(1)  # (B, 1, H, W) – same layout as nav_pred
+        # ─────────────────────────────────────────────────────────────────────
 
         act_ixs = goal_pfs.view(B, -1).max(dim=1).indices
         # Convert action to (0, 1) values for x and y coors
@@ -269,7 +331,7 @@ class RL_Policy(nn.Module):
             actions.append((act_y, act_x))
         actions = torch.Tensor(actions).to(pfs.device)
 
-        return actions
+        return actions, valid_mask_out
 
     def evaluate_actions(self, inputs, rnn_hxs, masks, action, extras=None):
 

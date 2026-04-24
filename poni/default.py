@@ -84,6 +84,33 @@ _C.DATASET.enable_actions = False
 _C.DATASET.num_actions = 4
 _C.DATASET.turn_angle = 30
 
+# ── Navigability Completion Module (NCM) ─────────────────────────────────────
+
+# β coefficient for frontier-weighted BCE loss.
+# Loss weight at frontier pixels = (1 + β); interior pixels stay at weight 1.
+# Higher β focuses the navigability head more on frontier boundaries, where
+# waypoint decisions matter most and prediction uncertainty is highest.
+_C.DATASET.nav_frontier_weight_beta = 2.0
+
+# Dilation radius (in pixels) applied to the binary frontier mask when
+# computing frontier_weight, so the emphasis covers a neighbourhood of each
+# frontier edge rather than just the single-pixel boundary.
+_C.DATASET.nav_frontier_dilate_k = 15  # must be odd
+
+# Model side: controls whether nav_decoder is instantiated and nav_loss used.
+_C.MODEL.enable_nav_head = False
+
+# λ_nav: weight of the navigability BCE loss relative to the main PF loss.
+# Total loss = L_pf [+ λ_area * L_area] + λ_nav * L_nav
+_C.MODEL.nav_loss_weight = 0.5
+
+# pos_weight for BCEWithLogitsLoss: compensates the floor/non-floor imbalance.
+# Typically floor cells are a small fraction of the local map → use ~3–5.
+_C.MODEL.nav_pos_weight = 3.0
+
+# Inference side: whether to gate goal_pf with the predicted navigability mask
+# before argmax when selecting waypoints.
+_C.MODEL.nav_gate_waypoint = True
 
 def get_cfg(
     config_paths: Optional[Union[List[str], str]] = None,

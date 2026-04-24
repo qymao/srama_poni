@@ -168,6 +168,7 @@ for dset, categories in OBJECT_CATEGORIES.items():
     NUM_OBJECT_CATEGORIES[dset] = len(categories)
 CAT_OFFSET = 1
 FLOOR_ID = 0
+WALL_ID = 1  # one-hot channel index for "wall" (semantic id == WALL_ID + CAT_OFFSET)
 # Modified version of d3_40_colors_rgb from habitat_sim.
 d3_40_colors_rgb = np.array(
     [
