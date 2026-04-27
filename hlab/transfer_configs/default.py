@@ -114,6 +114,7 @@ _C.PF_EXP_POLICY.mask_nearest_locations = True
 _C.PF_EXP_POLICY.mask_size = 1.0
 _C.PF_EXP_POLICY.area_weight_coef = 0.5
 _C.PF_EXP_POLICY.dist_weight_coef = 0.3
+_C.PF_EXP_POLICY.nav_gate_waypoint = None  # None = defer to ckpt cfg.MODEL.nav_gate_waypoint
 ################################################################################
 # NFExp policy
 ################################################################################

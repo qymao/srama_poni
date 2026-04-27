@@ -33,6 +33,7 @@ class PFExp(RL_Policy):
         args.map_resolution = gcfg.map_resolution
         args.area_weight_coef = pcfg.area_weight_coef
         args.dist_weight_coef = pcfg.dist_weight_coef
+        args.nav_gate_waypoint = pcfg.nav_gate_waypoint  # None = defer to ckpt
         args.map_size_cm = cfg.PLANNER.map_size_cm
 
         return cls(cfg, args, pcfg.pf_model_path)

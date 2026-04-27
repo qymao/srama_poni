@@ -296,7 +296,14 @@ class RL_Policy(nn.Module):
         # hyper-parameter.
         valid_mask_out = None   # exposed to act() for visualization
         cfg_model = self.network.cfg.MODEL
-        if nav_pred is not None and cfg_model.get("nav_gate_waypoint", True):
+        # args.nav_gate_waypoint (set via shell / transfer config) takes priority;
+        # fall back to the value baked into the checkpoint's cfg.MODEL.
+        _args_override = getattr(self.args, "nav_gate_waypoint", None)
+        _use_nav_gate = (
+            _args_override if _args_override is not None
+            else cfg_model.get("nav_gate_waypoint", True)
+        )
+        if nav_pred is not None and _use_nav_gate:
             nav_prob = nav_pred.squeeze(1)   # (B, H, W), ∈ [0, 1]
 
             if proc_inputs is not None:
